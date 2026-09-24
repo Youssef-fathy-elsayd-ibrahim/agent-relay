@@ -23,7 +23,7 @@ def _database_url() -> str:
         os.getenv("RELAY_DATABASE_URL")
         or os.getenv("DATABASE_URL")
         or os.getenv("POSTGRES_URL")
-        or "postgresql+psycopg://postgres:postgres@postgres:5432/agent_relay"
+        or "sqlite:///agent_relay.db"
     )
 
 
