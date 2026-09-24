@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r <(python - <<'PY'
+          import tomllib
+          with open('pyproject.toml', 'rb') as f:
+              data = tomllib.load(f)
+          deps = data.get('project', {}).get('dependencies', [])
+          for dep in deps:
+              print(dep)
+          PY
+          )
+
+      - name: Run unit tests
+        run: pytest -q
+
+  integration-tests:
+    name: Integration tests with PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: agent_relay
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d agent_relay"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install fastapi "psycopg[binary]>=3.3.5" "pydantic-settings>=2.15.0" "sqlalchemy>=2.0.52" "uvicorn[standard]>=0.52.4" pytest
+
+      - name: Run PostgreSQL-backed integration tests
+        env:
+          RELAY_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/agent_relay
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/agent_relay
+        run: pytest -q
+
+  docker-build:
+    name: Build Docker image
+    needs: [unit-tests, integration-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t agent-relay:local .
+
+  kind-deploy:
+    name: Load into kind and deploy
+    needs: [docker-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.12.0
+
+      - name: Load image into kind
+        run: |
+          kind load docker-image agent-relay:local --name kind
+
+      - name: Deploy PostgreSQL and API manifests
+        run: |
+          kubectl apply -f k8s/
+
+      - name: Wait for rollout completion
+        run: |
+          kubectl rollout status deployment/postgres --timeout=180s
+          kubectl rollout status deployment/agent-relay --timeout=180s

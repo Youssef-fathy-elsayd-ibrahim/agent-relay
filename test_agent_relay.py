@@ -152,6 +152,62 @@ def test_expiry_requeues_and_old_token_is_stale_before_recovery():
         assert second.json()["claim_token"] != first["claim_token"]
 
 
+def test_end_to_end_workflow_via_real_api_and_database():
+    with TestClient(main.app) as client:
+        sender, sender_headers = register(client, "sender")
+        recipient, recipient_headers = register(client, "worker")
+
+        created = client.post(
+            "/api/v1/tasks",
+            headers=sender_headers,
+            json={"to": recipient["agent_id"], "input": "hello relay"},
+        )
+        assert created.status_code == 201
+        task_id = created.json()["task_id"]
+
+        claimed = client.post(
+            "/api/v1/tasks/claim",
+            headers=recipient_headers,
+            json={"worker_id": "worker-a", "wait_seconds": 0},
+        )
+        assert claimed.status_code == 200
+        claim = claimed.json()
+        assert claim["task_id"] == task_id
+        assert claim["attempt"] == 1
+        assert claim["input"] == "hello relay"
+
+        with db_session() as db:
+            task = db.get(Task, task_id)
+            assert task is not None
+            assert task.status == "processing"
+            assert task.attempt_count == 1
+            assert len(task.attempts) == 1
+            assert task.attempts[0].outcome == "processing"
+
+        completed = client.post(
+            f"/api/v1/tasks/{task_id}/complete",
+            headers=recipient_headers,
+            json={"claim_token": claim["claim_token"], "output": "HELLO RELAY"},
+        )
+        assert completed.status_code == 200
+        assert completed.json()["status"] == "completed"
+
+        fetched = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers)
+        assert fetched.status_code == 200
+        assert fetched.json()["status"] == "completed"
+        assert fetched.json()["output"] == "HELLO RELAY"
+
+        with db_session() as db:
+            task = db.get(Task, task_id)
+            assert task is not None
+            assert task.status == "completed"
+            assert task.output == "HELLO RELAY"
+            assert task.attempt_count == 1
+            assert len(task.attempts) == 1
+            assert task.attempts[0].outcome == "completed"
+            assert task.attempts[0].terminal_action == "complete"
+
+
 def test_dashboard_is_asset_and_invalid_input_is_documented_error():
     with TestClient(main.app) as client:
         page = client.get("/")
